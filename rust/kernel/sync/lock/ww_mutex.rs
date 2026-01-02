@@ -6,6 +6,8 @@
 //! that belong to the same [`Class`]. Each lock acquisition uses an
 //! [`AcquireCtx`] to track ordering and ensure forward progress.
 //!
+//! [`ww_transaction`] provides automatic deadlock recovery for ordinary guards.
+//!
 //! See srctree/Documentation/locking/ww-mutex-design.rst for more details.
 
 use crate::{
@@ -21,9 +23,14 @@ use crate::{
 use core::cell::UnsafeCell;
 
 pub use acquire_ctx::AcquireCtx;
+pub use acquire_ctx_backoff::{
+    ww_transaction,
+    AcquireCtxBackoff, //
+};
 pub use class::Class;
 
 mod acquire_ctx;
+mod acquire_ctx_backoff;
 mod class;
 
 /// A wound-wait (ww) mutex that is powered with deadlock avoidance
