@@ -7,6 +7,8 @@
 //! [`AcquireCtx`] to track ordering and ensure forward progress.
 //!
 //! [`ww_transaction`] provides automatic deadlock recovery for ordinary guards.
+//! Use [`DynLockSet::ww_transaction`] for dynamically discovered locks and
+//! separate acquisition and work callbacks.
 //!
 //! See srctree/Documentation/locking/ww-mutex-design.rst for more details.
 
@@ -28,10 +30,12 @@ pub use acquire_ctx_backoff::{
     AcquireCtxBackoff, //
 };
 pub use class::Class;
+pub use dyn_lock_set::DynLockSet;
 
 mod acquire_ctx;
 mod acquire_ctx_backoff;
 mod class;
+mod dyn_lock_set;
 
 /// A wound-wait (ww) mutex that is powered with deadlock avoidance
 /// when acquiring multiple locks of the same [`Class`].

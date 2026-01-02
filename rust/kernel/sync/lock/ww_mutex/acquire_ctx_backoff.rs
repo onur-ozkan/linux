@@ -8,13 +8,17 @@ use super::{
     Mutex,
     MutexGuard, //
 };
-use crate::prelude::*;
+use crate::{
+    bindings,
+    prelude::*, //
+};
 use core::cell::Cell;
 
 /// An [`AcquireCtx`] that remembers the contended mutex.
 ///
 /// After [`Self::lock`] returns [`EDEADLK`], release all guards and call
-/// [`Self::backoff`] before retrying. [`ww_transaction`] handles this retry loop.
+/// [`Self::backoff`] before retrying. [`ww_transaction`] and
+/// [`super::DynLockSet::ww_transaction`] handle this retry loop.
 ///
 /// Mutexes must outlive this wrapper so they remain valid for retry.
 ///
@@ -109,10 +113,35 @@ impl<'ctx, 'a> AcquireCtxBackoff<'ctx, 'a> {
     }
 
     #[inline]
-    fn assert_no_locks_held(&self) {
+    pub(super) fn take_contended_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        self.backoff_guard.take()
+    }
+
+    #[inline]
+    pub(super) fn assert_no_locks_held(&self) {
         // SAFETY: This initialized context belongs to the current task.
         let acquired = unsafe { (*self.ctx.inner.get()).acquired };
         assert_eq!(acquired, 0, "ww transaction still holds caller-owned locks");
+    }
+
+    #[inline]
+    pub(super) fn clear_backoff(&self) {
+        drop(self.backoff_guard.take());
+        self.contended.set(None);
+    }
+
+    pub(super) fn restart(&self) {
+        self.clear_backoff();
+        self.assert_no_locks_held();
+        let ptr = self.ctx.inner.get();
+        // SAFETY: This wrapper exclusively borrows the initialized, pinned context.
+        // No acquired locks remain, so it can be finalized and reinitialized with
+        // its static class.
+        unsafe {
+            let class = (*ptr).ww_class;
+            bindings::ww_acquire_fini(ptr);
+            bindings::ww_acquire_init(ptr, class);
+        }
     }
 }
 
@@ -164,7 +193,7 @@ pub fn ww_transaction<'a, R>(
     retry(&ctx, || transaction(&ctx))
 }
 
-fn retry<R>(
+pub(super) fn retry<R>(
     ctx: &AcquireCtxBackoff<'_, '_>,
     mut transaction: impl FnMut() -> Result<R>,
 ) -> Result<R> {
@@ -178,6 +207,7 @@ fn retry<R>(
 
 #[kunit_tests(rust_kernel_ww_transaction)]
 mod tests {
+    use super::super::DynLockSet;
     use super::*;
     use crate::define_ww_class;
     use pin_init::stack_pin_init;
@@ -278,6 +308,106 @@ mod tests {
         assert_eq!(result, Err(EDEADLK));
         assert_eq!(attempts, 1);
         assert!(!mutex.is_locked());
+        Ok(())
+    }
+
+    #[test]
+    fn test_dynamic_retry() -> Result {
+        stack_pin_init!(let first = Mutex::new(10, &TEST_TRANSACTION_CLASS));
+        stack_pin_init!(let second = Mutex::new(20, &TEST_TRANSACTION_CLASS));
+        stack_pin_init!(let acquire_ctx = AcquireCtx::new(&TEST_TRANSACTION_CLASS));
+        let ctx = AcquireCtxBackoff::new(acquire_ctx.as_mut());
+        let mut set = DynLockSet::new(&ctx);
+        let mut attempts = 0;
+        let mut identity = None;
+
+        let result = set.ww_transaction(
+            |set| {
+                attempts += 1;
+                let ptr = ctx.ctx.inner.get();
+                // SAFETY: The pinned context is initialized and used only by
+                // this task throughout the transaction.
+                let stamp = unsafe { (*ptr).stamp };
+                if attempts == 1 {
+                    identity = Some((ptr, stamp));
+                    set.lock(&first)?;
+                    // SAFETY: `second` is initialized, pinned, and outlives the transaction.
+                    let mutex = unsafe { Mutex::from_raw(second.inner.get()) };
+                    ctx.contended.set(Some(mutex));
+                    return Err(EDEADLK);
+                }
+
+                assert_eq!(attempts, 2);
+                assert_eq!(identity, Some((ptr, stamp)));
+                assert!(!first.is_locked());
+                // Backoff makes the contended mutex available before lock().
+                assert_eq!(set.with_locked(&second, |v| *v)?, 20);
+                set.lock(&second)?;
+                set.lock(&first)
+            },
+            |set| {
+                set.with_locked(&first, |v| *v += 1)?;
+                set.with_locked(&second, |v| {
+                    *v += 2;
+                    *v
+                })
+            },
+        )?;
+
+        assert_eq!(result, 22);
+        assert_eq!(attempts, 2);
+        assert!(!first.is_locked());
+        assert!(!second.is_locked());
+        Ok(())
+    }
+
+    #[test]
+    fn test_dynamic_error_cleanup() -> Result {
+        stack_pin_init!(let first = Mutex::new(1, &TEST_TRANSACTION_CLASS));
+        stack_pin_init!(let contended = Mutex::new(2, &TEST_TRANSACTION_CLASS));
+        stack_pin_init!(let acquire_ctx = AcquireCtx::new(&TEST_TRANSACTION_CLASS));
+        let ctx = AcquireCtxBackoff::new(acquire_ctx.as_mut());
+        let mut set = DynLockSet::new(&ctx);
+
+        for swallow in [false, true] {
+            let mut work_ran = false;
+            let result = set.ww_transaction(
+                |set| {
+                    set.lock(&first)?;
+                    // A swallowed or mapped EDEADLK must not poison the next call.
+                    // SAFETY: `contended` is initialized, pinned, and outlives the transaction.
+                    let mutex = unsafe { Mutex::from_raw(contended.inner.get()) };
+                    ctx.contended.set(Some(mutex));
+                    assert_eq!(set.lock(&first), Err(EDEADLK));
+                    if swallow {
+                        Ok(())
+                    } else {
+                        Err(EINVAL)
+                    }
+                },
+                |set| {
+                    work_ran = true;
+                    ctx.done();
+                    set.with_locked(&first, |v| *v += 1)
+                },
+            );
+
+            assert_eq!(result, if swallow { Ok(()) } else { Err(EINVAL) });
+            assert_eq!(work_ran, swallow);
+            assert!(ctx.contended.get().is_none());
+            assert!(!first.is_locked());
+            assert!(!contended.is_locked());
+
+            set.ww_transaction(
+                |set| {
+                    set.lock(&contended)?;
+                    set.lock(&first)
+                },
+                |set| set.with_locked(&contended, |v| *v += 1),
+            )?;
+            assert!(!first.is_locked());
+            assert!(!contended.is_locked());
+        }
         Ok(())
     }
 }
