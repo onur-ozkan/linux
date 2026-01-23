@@ -7,7 +7,6 @@
 pub mod shmem;
 
 use crate::{
-    alloc::flags::*,
     bindings,
     drm::{
         self,
@@ -16,10 +15,7 @@ use crate::{
             AllocOps, //
         },
     },
-    error::{
-        to_result,
-        Result, //
-    },
+    error::to_result,
     prelude::*,
     sync::aref::{
         ARef,
