@@ -197,7 +197,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
     pub fn new(dev: &device::Device) -> Result<Self> {
         // `__drm_dev_alloc` uses `kmalloc()` to allocate memory, hence ensure a `kmalloc()`
         // compatible `Layout`.
-        let layout = Kmalloc::aligned_layout(Layout::new::<Self>());
+        let layout = Kmalloc::aligned_layout(Layout::new::<Device<T, Uninit>>());
 
         // SAFETY:
         // - `VTABLE`, as a `const` is pinned to the read-only section of the compilation,
