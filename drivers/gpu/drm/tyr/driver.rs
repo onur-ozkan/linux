@@ -134,6 +134,7 @@ impl platform::Driver for TyrPlatformDeviceData {
         let gpu_info = GpuInfo::new(pdev.as_ref(), &iomem)?;
         gpu_info.log(pdev);
 
+        let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
         let platform: ARef<platform::Device> = pdev.into();
 
         let data = try_pin_init!(TyrDrmDeviceData {
@@ -149,9 +150,7 @@ impl platform::Driver for TyrPlatformDeviceData {
                 }),
                 gpu_info,
         });
-
-        let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref(), data)?;
-        let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), 0)?;
+        let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
 
         let driver = TyrPlatformDeviceData {
             _device: ddev.into(),
