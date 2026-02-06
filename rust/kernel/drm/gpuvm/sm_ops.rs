@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
+#![allow(clippy::type_complexity)]
 
 use super::*;
 
@@ -102,7 +103,7 @@ impl<'op, T: DriverGpuVm> OpMap<'op, T> {
 
 /// Represents a completed [`OpMap`] operation.
 pub struct OpMapped<'op, T> {
-    _invariant: PhantomData<*mut &'op mut T>,
+    _invariant: PhantomData<fn(&'op mut T) -> fn(&'op mut T)>,
 }
 
 /// Represents an `sm_step_unmap` operation that has not yet been completed.
