@@ -33,7 +33,7 @@ pub struct RawIoSysMap<const SIZE: usize = 0>(bindings::iosys_map);
 
 impl<const SIZE: usize> RawIoSysMap<SIZE> {
     /// Convert from a raw `bindings::iosys_map`.
-    #[expect(unused)]
+    #[allow(unused)]
     #[inline]
     pub(crate) fn from_raw(val: bindings::iosys_map) -> Self {
         Self(val)
@@ -141,7 +141,6 @@ impl<'a, const SIZE: usize> IoSysMapRef<'a, SIZE> {
     ///
     /// - The caller guarantees that the mapping is of at least `size` bytes.
     /// - The caller guarantees that the mapping remains valid for the lifetime of `'a`.
-    #[expect(unused)]
     pub(crate) unsafe fn new(map: RawIoSysMap<SIZE>, size: usize) -> Result<Self> {
         if size < SIZE {
             return Err(EINVAL);
