@@ -15,7 +15,8 @@ use crate::{
         device,
         driver,
         gem,
-        private::Sealed, //
+        private::Sealed,
+        DeviceContext, //
     },
     error::{
         from_err_ptr,
@@ -117,8 +118,8 @@ impl<T: DriverObject> Object<T> {
     /// Create a new shmem-backed DRM object of the given size.
     ///
     /// Additional config options can be specified using `config`.
-    pub fn new(
-        dev: &device::Device<T::Driver>,
+    pub fn new<Ctx: DeviceContext>(
+        dev: &device::Device<T::Driver, Ctx>,
         size: usize,
         config: ObjectConfig<'_, T>,
         args: T::Args,
