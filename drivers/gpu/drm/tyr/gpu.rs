@@ -139,7 +139,6 @@ impl GpuInfo {
     }
 
     /// Returns the number of physical address bits supported by the GPU.
-    #[expect(dead_code)]
     pub(crate) fn pa_bits(&self) -> u32 {
         (self.mmu_features >> 8) & genmask_u32(0..=7)
     }
