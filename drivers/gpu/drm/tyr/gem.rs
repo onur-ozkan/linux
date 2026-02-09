@@ -1,28 +1,64 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
+//! GEM buffer object management for the Tyr driver.
+//!
+//! This module provides buffer object (BO) management functionality using
+//! DRM's GEM subsystem with shmem backing.
 
 use kernel::{
     drm::{
         gem,
+        gem::shmem,
         DeviceContext, //
     },
-    prelude::*, //
+    prelude::*,
+    sync::aref::ARef, //
 };
 
-use crate::driver::TyrDrmDriver;
+use crate::driver::{
+    TyrDrmDevice,
+    TyrDrmDriver, //
+};
 
-/// GEM Object inner driver data
+/// Tyr's DriverObject type for GEM objects.
 #[pin_data]
-pub(crate) struct BoData {}
+pub(crate) struct BoData {
+    flags: u32,
+}
+
+/// Provides a way to pass arguments when creating BoData
+/// as required by the gem::DriverObject trait.
+pub(crate) struct BoCreateArgs {
+    flags: u32,
+}
 
 impl gem::DriverObject for BoData {
     type Driver = TyrDrmDriver;
-    type Args = ();
+    type Args = BoCreateArgs;
 
     fn new<Ctx: DeviceContext>(
-        _dev: &kernel::drm::Device<TyrDrmDriver, Ctx>,
+        _dev: &TyrDrmDevice<Ctx>,
         _size: usize,
-        _args: (),
+        args: BoCreateArgs,
     ) -> impl PinInit<Self, Error> {
-        try_pin_init!(BoData {})
+        try_pin_init!(Self { flags: args.flags })
     }
+}
+
+/// Type alias for Tyr GEM buffer objects.
+pub(crate) type Bo = gem::shmem::Object<BoData>;
+
+/// Creates a dummy GEM object to serve as the root of a GPUVM.
+#[expect(dead_code)]
+pub(crate) fn new_dummy_object<Ctx: DeviceContext>(ddev: &TyrDrmDevice<Ctx>) -> Result<ARef<Bo>> {
+    let bo = gem::shmem::Object::<BoData>::new(
+        ddev,
+        4096,
+        shmem::ObjectConfig {
+            map_wc: true,
+            parent_resv_obj: None,
+        },
+        BoCreateArgs { flags: 0 },
+    )?;
+
+    Ok(bo)
 }
