@@ -30,6 +30,7 @@ use kernel::{
     sizes::SZ_2M,
     sync::{
         aref::ARef,
+        Arc,
         Mutex, //
     },
     time,
@@ -41,6 +42,7 @@ use crate::{
     gem::BoData,
     gpu,
     gpu::GpuInfo,
+    mmu::Mmu,
     regs::gpu_control::*, //
 };
 
@@ -71,7 +73,7 @@ pub(crate) struct TyrDrmRegistrationData<'bound> {
     regulators: Mutex<Regulators>,
 
     /// GPU MMIO register mapping.
-    pub(crate) iomem: IoMem<'bound>,
+    pub(crate) iomem: Arc<IoMem<'bound>>,
 
     /// Some information on the GPU.
     ///
@@ -124,7 +126,8 @@ impl platform::Driver for TyrPlatformDriver {
         let sram_regulator = Regulator::<regulator::Enabled>::get(pdev.as_ref(), c"sram")?;
 
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
-        let iomem = request.iomap_sized::<SZ_2M>()?;
+
+        let iomem = Arc::new(request.iomap_sized::<SZ_2M>()?, GFP_KERNEL)?;
 
         issue_soft_reset(pdev.as_ref(), &iomem)?;
         gpu::l2_power_on(pdev.as_ref(), &iomem)?;
@@ -141,6 +144,8 @@ impl platform::Driver for TyrPlatformDriver {
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(pa_bits)?)? };
 
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(pdev, Ok(()))?;
+
+        let _mmu = Mmu::new(iomem.as_arc_borrow(), &gpu_info)?;
 
         let reg_data = try_pin_init!(TyrDrmRegistrationData {
                 pdev,
