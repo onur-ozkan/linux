@@ -6,10 +6,15 @@
 
 use kernel::{
     drm::{
-        gem,
+        self,
+        gem::{
+            self,
+            shmem, //
+        },
         DeviceContext, //
     },
-    prelude::*, //
+    prelude::*,
+    sync::aref::ARef, //
 };
 
 use crate::driver::{
@@ -40,4 +45,22 @@ impl gem::DriverObject for BoData {
     ) -> impl PinInit<Self, Error> {
         try_pin_init!(Self { flags: args.flags })
     }
+}
+
+/// Type alias for Tyr GEM buffer objects.
+pub(crate) type Bo = gem::shmem::Object<BoData, drm::Uninit>;
+
+/// Creates a dummy GEM object to serve as the root of a GPUVM.
+pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice<drm::Uninit>) -> Result<ARef<Bo>> {
+    let bo = Bo::new(
+        ddev,
+        4096,
+        shmem::ObjectConfig {
+            map_wc: true,
+            parent_resv_obj: None,
+        },
+        BoCreateArgs { flags: 0 },
+    )?;
+
+    Ok(bo)
 }
