@@ -43,6 +43,7 @@ use crate::{
     gem::BoData,
     gpu,
     gpu::GpuInfo,
+    mmu::Mmu,
     regs, //
 };
 
@@ -147,6 +148,8 @@ impl platform::Driver for TyrPlatformDeviceData {
 
         let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
         let platform: ARef<platform::Device> = pdev.into();
+
+        let _mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info)?;
 
         let data = try_pin_init!(TyrDrmDeviceData {
                 pdev: platform.clone(),
