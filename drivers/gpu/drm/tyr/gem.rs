@@ -48,7 +48,6 @@ impl gem::DriverObject for BoData {
 pub(crate) type Bo = gem::shmem::Object<BoData>;
 
 /// Creates a dummy GEM object to serve as the root of a GPUVM.
-#[expect(dead_code)]
 pub(crate) fn new_dummy_object<Ctx: DeviceContext>(ddev: &TyrDrmDevice<Ctx>) -> Result<ARef<Bo>> {
     let bo = gem::shmem::Object::<BoData>::new(
         ddev,
