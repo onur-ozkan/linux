@@ -177,6 +177,7 @@
 
 &gpu {
 	mali-supply = <&vdd_gpu_s0>;
+	sram-supply = <&vdd_gpu_mem_s0>;
 	status = "okay";
 };
 
@@ -537,7 +538,7 @@
 		};
 
 		regulators {
-			vdd_gpu_s0: dcdc-reg1 {
+			vdd_gpu_s0: vdd_gpu_mem_s0: dcdc-reg1 {
 				regulator-name = "vdd_gpu_s0";
 				regulator-boot-on;
 				regulator-min-microvolt = <550000>;
