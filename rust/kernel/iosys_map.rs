@@ -92,16 +92,18 @@ macro_rules! impl_raw_iosys_map_io_capable {
         impl<const SIZE: usize> IoCapable<$ty> for RawIoSysMap<SIZE> {
             #[inline(always)]
             unsafe fn io_read(&self, address: usize) -> $ty {
+                let offset = address - self.addr();
                 // SAFETY: By the trait invariant `address` is a valid address for iosys map
                 // operations.
-                unsafe { bindings::$read_fn(&self.0, address) }
+                unsafe { bindings::$read_fn(&self.0, offset) }
             }
 
             #[inline(always)]
             unsafe fn io_write(&self, value: $ty, address: usize) {
+                let offset = address - self.addr();
                 // SAFETY: By the trait invariant `address` is a valid address for iosys map
                 // operations.
-                unsafe { bindings::$write_fn(&self.0, address, value) };
+                unsafe { bindings::$write_fn(&self.0, offset, value) };
             }
         }
     };
