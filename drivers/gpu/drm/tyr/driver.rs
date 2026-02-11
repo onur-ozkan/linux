@@ -39,6 +39,7 @@ use kernel::{
 
 use crate::{
     file::TyrDrmFileData,
+    fw::Firmware,
     gem::BoData,
     gpu,
     gpu::GpuInfo,
@@ -65,6 +66,9 @@ pub(crate) struct TyrPlatformDriverData<'bound> {
 pub(crate) struct TyrDrmRegistrationData<'bound> {
     /// Parent platform device.
     pub(crate) pdev: &'bound platform::Device<Bound>,
+
+    /// Firmware sections.
+    pub(crate) fw: Firmware<'bound>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -145,10 +149,21 @@ impl platform::Driver for TyrPlatformDriver {
 
         let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(pdev, Ok(()))?;
 
-        let _mmu = Mmu::new(iomem.as_arc_borrow(), &gpu_info)?;
+        let mmu = Mmu::new(iomem.as_arc_borrow(), &gpu_info)?;
+
+        let firmware = Firmware::new(
+            pdev,
+            iomem.clone(),
+            &unreg_dev,
+            mmu.as_arc_borrow(),
+            &gpu_info,
+        )?;
+
+        firmware.boot()?;
 
         let reg_data = try_pin_init!(TyrDrmRegistrationData {
                 pdev,
+                fw: firmware,
                 clks <- new_mutex!(Clocks {
                     core: core_clk,
                     stacks: stacks_clk,
