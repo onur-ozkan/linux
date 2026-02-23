@@ -412,9 +412,7 @@ impl<D: DriverObject, const SIZE: usize> VMap<D, SIZE> {
         // - The size of the iosys_map is equivalent to the size of the gem object.
         // - `size` is >= SIZE according to our type invariants, ensuring that we can never pass an
         //   invalid `size` to `IoSysMapRef::new().
-        unsafe {
-            IoSysMapRef::new(self.map.clone(), self.owner.size()).unwrap_unchecked()
-        }
+        unsafe { IoSysMapRef::new(self.map.clone(), self.owner.size()).unwrap_unchecked() }
     }
 
     /// Borrows a reference to the object that owns this virtual mapping.
