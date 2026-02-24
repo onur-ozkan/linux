@@ -195,6 +195,7 @@ use crate::{
     types::Opaque,
 };
 use core::marker::PhantomData;
+use core::ptr::NonNull;
 
 /// Creates a [`Work`] initialiser with the given name and a newly-created lock class.
 #[macro_export]
@@ -343,6 +344,51 @@ impl Queue {
 
         self.enqueue(KBox::pin_init(init, flags).map_err(|_| AllocError)?);
         Ok(())
+    }
+}
+
+/// A kernel work queue that allocates and owns an ordered `workqueue_struct`.
+///
+/// Unlike [`Queue`], [`OrderedQueue`] takes ownership of the underlying C
+/// workqueue and automatically destroys it when dropped.
+pub struct OrderedQueue(NonNull<bindings::workqueue_struct>);
+
+// SAFETY: Workqueue objects are thread-safe to share and use concurrently.
+unsafe impl Send for OrderedQueue {}
+// SAFETY: Workqueue objects are thread-safe to share and use concurrently.
+unsafe impl Sync for OrderedQueue {}
+
+impl OrderedQueue {
+    /// Allocates an ordered workqueue.
+    ///
+    /// It is equivalent to C's `alloc_ordered_workqueue()`.
+    pub fn new(name: &'static CStr, flags: u32) -> Result<Self> {
+        // SAFETY: Calls into C allocator, returning either a valid pointer or null.
+        let ptr = unsafe { bindings::alloc_ordered_workqueue(name.as_char_ptr(), flags) };
+        let ptr = NonNull::new(ptr).ok_or(ENOMEM)?;
+        Ok(Self(ptr))
+    }
+
+    /// Enqueues a work item.
+    ///
+    /// This may fail if the work item is already enqueued in a workqueue.
+    ///
+    /// The work item will be submitted using `WORK_CPU_UNBOUND`.
+    pub fn enqueue<W, const ID: u64>(&self, w: W) -> W::EnqueueOutput
+    where
+        W: RawWorkItem<ID> + Send + 'static,
+    {
+        // SAFETY: `self.0` is valid while `self` is alive.
+        unsafe { Queue::from_raw(self.0.as_ptr()) }.enqueue(w)
+    }
+}
+
+impl Drop for OrderedQueue {
+    fn drop(&mut self) {
+        // SAFETY:
+        // - Pointer comes from `alloc_ordered_workqueue()` and is owned by `self`.
+        // - `OrderedQueue` does not expose delayed scheduling API.
+        unsafe { bindings::destroy_workqueue(self.0.as_ptr()) };
     }
 }
 
