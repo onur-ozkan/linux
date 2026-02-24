@@ -530,6 +530,16 @@ impl<T: ?Sized, const ID: u64> Work<T, ID> {
         // the compiler does not complain that the `work` field is unused.
         unsafe { Opaque::cast_into(core::ptr::addr_of!((*ptr).work)) }
     }
+
+    /// Disables this work item and waits for queued/running executions to finish.
+    #[inline]
+    pub fn disable_sync(&self) {
+        let ptr: *const Self = self;
+        // SAFETY: `self` points to a valid initialized work.
+        let raw_work = unsafe { Self::raw_get(ptr) };
+        // SAFETY: `raw_work` is a valid embedded `work_struct`.
+        unsafe { bindings::disable_work_sync(raw_work) };
+    }
 }
 
 /// Declares that a type contains a [`Work<T, ID>`].
