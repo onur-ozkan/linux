@@ -6,11 +6,8 @@ use kernel::{
         OptionalClk, //
     },
     device::{
-        Bound,
-        Core,
-        Device, //
+        Core, //
     },
-    devres::Devres,
     dma::{
         Device as DmaDevice,
         DmaMask, //
@@ -22,10 +19,7 @@ use kernel::{
         Registered,
         UnregisteredDevice, //
     },
-    io::poll,
-    new_mutex,
-    of,
-    platform,
+    new_mutex, of, platform,
     prelude::*,
     regulator,
     regulator::Regulator,
@@ -35,16 +29,14 @@ use kernel::{
         Arc,
         Mutex, //
     },
-    time, //
 };
 
 use crate::{
     file::TyrDrmFileData,
     gem::BoData,
-    gpu,
     gpu::GpuInfo,
     mmu::Mmu,
-    regs, //
+    reset, //
 };
 
 pub(crate) type IoMem = kernel::io::mem::IoMem<SZ_2M>;
@@ -61,6 +53,11 @@ pub(crate) struct TyrPlatformDeviceData {
 
 #[pin_data]
 pub(crate) struct TyrDrmDeviceData {
+    // `ResetHandle::drop()` drains queued/running works and this must happen
+    // before clocks/regulators are dropped. So keep this field before them to
+    // ensure the correct drop order.
+    pub(crate) reset: reset::ResetHandle,
+
     pub(crate) pdev: ARef<platform::Device>,
 
     #[pin]
@@ -86,22 +83,6 @@ pub(crate) struct TyrDrmDeviceData {
 unsafe impl Send for TyrDrmDeviceData {}
 // SAFETY: This will be removed in a future patch.
 unsafe impl Sync for TyrDrmDeviceData {}
-
-fn issue_soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
-    // Clear any stale reset-complete IRQ state before issuing a new soft reset.
-    regs::GPU_IRQ_CLEAR.write(dev, iomem, regs::GPU_IRQ_RAWSTAT_RESET_COMPLETED)?;
-    regs::GPU_CMD.write(dev, iomem, regs::GPU_CMD_SOFT_RESET)?;
-
-    poll::read_poll_timeout(
-        || regs::GPU_IRQ_RAWSTAT.read(dev, iomem),
-        |status| *status & regs::GPU_IRQ_RAWSTAT_RESET_COMPLETED != 0,
-        time::Delta::from_millis(1),
-        time::Delta::from_millis(100),
-    )
-    .inspect_err(|_| dev_err!(dev, "GPU reset failed."))?;
-
-    Ok(())
-}
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -135,8 +116,7 @@ impl platform::Driver for TyrPlatformDeviceData {
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
         let iomem = Arc::pin_init(request.iomap_sized::<SZ_2M>(), GFP_KERNEL)?;
 
-        issue_soft_reset(pdev.as_ref(), &iomem)?;
-        gpu::l2_power_on(pdev.as_ref(), &iomem)?;
+        reset::run_reset(pdev.as_ref(), &iomem)?;
 
         let gpu_info = GpuInfo::new(pdev.as_ref(), &iomem)?;
         gpu_info.log(pdev);
@@ -150,6 +130,7 @@ impl platform::Driver for TyrPlatformDeviceData {
 
         let uninit_ddev = UnregisteredDevice::<TyrDrmDriver>::new(pdev.as_ref())?;
         let platform: ARef<platform::Device> = pdev.into();
+        let reset = reset::ResetHandle::new(platform.clone(), iomem.clone())?;
 
         let _mmu = Mmu::new(pdev, iomem.as_arc_borrow(), &gpu_info)?;
 
@@ -164,6 +145,7 @@ impl platform::Driver for TyrPlatformDeviceData {
                     _mali: mali_regulator,
                     _sram: sram_regulator,
                 }),
+                reset,
                 gpu_info,
         });
         let ddev = Registration::new_foreign_owned(uninit_ddev, pdev.as_ref(), data, 0)?;
