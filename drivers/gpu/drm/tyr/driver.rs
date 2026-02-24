@@ -88,6 +88,8 @@ unsafe impl Send for TyrDrmDeviceData {}
 unsafe impl Sync for TyrDrmDeviceData {}
 
 fn issue_soft_reset(dev: &Device<Bound>, iomem: &Devres<IoMem>) -> Result {
+    // Clear any stale reset-complete IRQ state before issuing a new soft reset.
+    regs::GPU_IRQ_CLEAR.write(dev, iomem, regs::GPU_IRQ_RAWSTAT_RESET_COMPLETED)?;
     regs::GPU_CMD.write(dev, iomem, regs::GPU_CMD_SOFT_RESET)?;
 
     poll::read_poll_timeout(
