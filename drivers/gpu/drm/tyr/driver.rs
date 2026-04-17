@@ -68,7 +68,7 @@ pub(crate) struct TyrDrmRegistrationData<'bound> {
     pub(crate) pdev: &'bound platform::Device<Bound>,
 
     /// Firmware sections.
-    pub(crate) fw: Firmware<'bound>,
+    pub(crate) fw: Arc<Firmware<'bound>>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -160,6 +160,7 @@ impl platform::Driver for TyrPlatformDriver {
         )?;
 
         firmware.boot()?;
+        firmware.enable_global_interface()?;
 
         let reg_data = try_pin_init!(TyrDrmRegistrationData {
                 pdev,
