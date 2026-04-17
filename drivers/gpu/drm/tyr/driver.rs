@@ -71,7 +71,7 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     pub(crate) pdev: &'drm platform::Device<Bound>,
 
     /// Firmware sections.
-    pub(crate) fw: Firmware<'drm>,
+    pub(crate) fw: Arc<Firmware<'drm>>,
 
     #[pin]
     clks: Mutex<Clocks>,
@@ -161,6 +161,7 @@ impl platform::Driver for TyrPlatformDriver {
             )?;
 
             firmware.boot()?;
+            firmware.enable_global_interface()?;
 
             Ok(try_pin_init!(TyrPlatformDriverData {
                 // SAFETY: `_reg` is stored in `TyrPlatformDriverData` and dropped when the

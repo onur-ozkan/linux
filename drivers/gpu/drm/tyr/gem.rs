@@ -133,6 +133,11 @@ impl<'drm> KernelBo<'drm> {
         })
     }
 
+    /// Returns the GPU virtual address range occupied by this buffer.
+    pub(crate) fn va_range(&self) -> Range<u64> {
+        self.va_range.clone()
+    }
+
     pub(crate) fn bo(&self) -> &Bo {
         &self.bo
     }

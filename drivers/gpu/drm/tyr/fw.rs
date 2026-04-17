@@ -26,12 +26,14 @@ use kernel::{
         poll,
         Io, //
     },
+    new_mutex,
     num::Bounded,
     prelude::*,
     str::CString,
     sync::{
         Arc,
-        ArcBorrow, //
+        ArcBorrow,
+        Mutex, //
     },
     time, //
 };
@@ -41,9 +43,12 @@ use crate::{
         IoMem,
         TyrDrmDevice, //
     },
-    fw::parser::{
-        FwParser,
-        ParsedSection, //
+    fw::{
+        interfaces::GlobalInterface,
+        parser::{
+            FwParser,
+            ParsedSection, //
+        },
     },
     gem,
     gem::{
@@ -69,8 +74,20 @@ use crate::{
     vm::Vm, //
 };
 
+mod interfaces;
 mod parser;
 
+/// Maximum number of CSG interfaces supported by hardware.
+const MAX_CSG: usize = 16;
+
+/// Maximum number of CS interfaces supported by hardware.
+const MAX_CS: usize = 16;
+
+/// MCU virtual address where the CSF shared memory region starts.
+///
+/// This region contains the firmware interface structures for communication between
+/// the CPU driver and MCU firmware, including the GLB_CONTROL_BLOCK at this base address.
+/// The firmware binary contains a section marked to be loaded at this address.
 pub(super) const CSF_MCU_SHARED_REGION_START: u32 = 0x04000000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -131,18 +148,18 @@ impl SectionFlags {
 }
 
 /// A parsed section of the firmware binary.
-struct Section<'drm> {
+pub(super) struct Section<'drm> {
     // Raw firmware section data for reset purposes
     #[expect(dead_code)]
     data: KVec<u8>,
 
     // Keep the BO backing this firmware section so that both the
     // GPU mapping and CPU mapping remain valid until the Section is dropped.
-    #[expect(dead_code)]
     mem: gem::KernelBo<'drm>,
 }
 
 /// Loaded firmware with sections mapped into MCU VM.
+#[pin_data(PinnedDrop)]
 pub(crate) struct Firmware<'drm> {
     /// Iomem need to access registers.
     iomem: Arc<IoMem<'drm>>,
@@ -151,12 +168,16 @@ pub(crate) struct Firmware<'drm> {
     vm: Arc<Vm<'drm>>,
 
     /// List of firmware sections.
-    #[expect(dead_code)]
     sections: KVec<Section<'drm>>,
+
+    /// The global FW interface.
+    #[pin]
+    global_iface: Mutex<GlobalInterface>,
 }
 
-impl<'drm> Drop for Firmware<'drm> {
-    fn drop(&mut self) {
+#[pinned_drop]
+impl PinnedDrop for Firmware<'_> {
+    fn drop(self: Pin<&mut Self>) {
         // Stop the MCU before releasing its firmware mappings and memory.
         let _ = self.stop();
 
@@ -218,7 +239,7 @@ impl<'drm> Firmware<'drm> {
         ddev: &TyrDrmDevice,
         mmu: ArcBorrow<'_, Mmu<'drm>>,
         gpu_info: &GpuInfo,
-    ) -> Result<Firmware<'drm>> {
+    ) -> Result<Arc<Firmware<'drm>>> {
         let vm = Vm::new(dev, ddev, mmu, gpu_info)?;
         vm.activate()?;
 
@@ -252,11 +273,15 @@ impl<'drm> Firmware<'drm> {
                 sections.push(Section { data, mem }, GFP_KERNEL)?;
             }
 
-            Ok(Firmware {
-                iomem,
-                vm: vm.clone(),
-                sections,
-            })
+            Arc::pin_init(
+                try_pin_init!(Firmware {
+                    iomem,
+                    vm: vm.clone(),
+                    sections,
+                    global_iface <- new_mutex!(GlobalInterface::new()?),
+                }),
+                GFP_KERNEL,
+            )
         })();
 
         if result.is_err() {
@@ -264,6 +289,26 @@ impl<'drm> Firmware<'drm> {
         }
 
         result
+    }
+
+    /// Get the shared memory section containing firmware interface structures.
+    pub(crate) fn shared_section(&self) -> Result<&Section<'drm>> {
+        self.sections
+            .iter()
+            .find(|section| section.mem.va_range().start == u64::from(CSF_MCU_SHARED_REGION_START))
+            .ok_or_else(|| {
+                pr_err!(
+                    "CSF shared section not found at 0x{:08x}\n",
+                    CSF_MCU_SHARED_REGION_START
+                );
+                EINVAL
+            })
+    }
+
+    /// Enable the global interface.
+    pub(crate) fn enable_global_interface(&self) -> Result {
+        let shared_section = self.shared_section()?;
+        self.global_iface.lock().enable(shared_section)
     }
 
     pub(crate) fn boot(&self) -> Result {
