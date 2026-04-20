@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <clocksource/arm_arch_timer.h>
 #include <linux/delay.h>
 #include <linux/ktime.h>
 #include <linux/timekeeping.h>
@@ -37,4 +38,9 @@ __rust_helper s64 rust_helper_ktime_to_ms(const ktime_t kt)
 __rust_helper void rust_helper_udelay(unsigned long usec)
 {
 	udelay(usec);
+}
+
+__rust_helper u32 rust_helper_arch_timer_get_rate(void)
+{
+	return arch_timer_get_rate();
 }
