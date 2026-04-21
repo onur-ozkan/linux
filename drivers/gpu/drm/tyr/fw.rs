@@ -15,6 +15,7 @@
 
 use kernel::{
     bits::genmask_u32,
+    clk::Clk,
     device::Bound,
     drm::{
         gem::BaseObject,
@@ -304,8 +305,10 @@ impl<'bound> Firmware<'bound> {
     }
 
     /// Enable the global interface.
-    pub(crate) fn enable_global_interface(&self) -> Result {
+    pub(crate) fn enable_global_interface(&self, gpu_info: &GpuInfo, core_clk: &Clk) -> Result {
         let shared_section = self.shared_section()?;
-        self.global_iface.lock().enable(shared_section)
+        self.global_iface
+            .lock()
+            .enable(&self.iomem, shared_section, gpu_info, core_clk)
     }
 }

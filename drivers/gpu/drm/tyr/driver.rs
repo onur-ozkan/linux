@@ -160,7 +160,7 @@ impl platform::Driver for TyrPlatformDriver {
         )?;
 
         firmware.boot()?;
-        firmware.enable_global_interface()?;
+        firmware.enable_global_interface(&gpu_info, &core_clk)?;
 
         let reg_data = try_pin_init!(TyrDrmRegistrationData {
                 pdev,
