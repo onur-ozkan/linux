@@ -161,7 +161,7 @@ impl platform::Driver for TyrPlatformDriver {
             )?;
 
             firmware.boot()?;
-            firmware.enable_global_interface()?;
+            firmware.enable_global_interface(&gpu_info, &core_clk)?;
 
             Ok(try_pin_init!(TyrPlatformDriverData {
                 // SAFETY: `_reg` is stored in `TyrPlatformDriverData` and dropped when the
