@@ -14,6 +14,7 @@ mod gem;
 mod gpu;
 mod mmu;
 mod regs;
+mod reset;
 mod slot;
 mod vm;
 mod wait;
