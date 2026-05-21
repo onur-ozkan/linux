@@ -16,10 +16,11 @@ use crate::{
         Bound,
         Device, //
     },
-    devres::Devres,
+    devres::DevresLt,
     error::to_result,
     io::PhysAddr,
-    prelude::*, //
+    prelude::*,
+    types::ForLt, //
 };
 
 use bindings::io_pgtable_fmt;
@@ -59,15 +60,16 @@ pub struct Config {
 /// # Invariants
 ///
 /// The pointer references a valid io page table.
-pub struct IoPageTable<F: IoPageTableFmt> {
+pub struct IoPageTable<'bound, F: IoPageTableFmt> {
+    dev: &'bound Device<Bound>,
     ptr: NonNull<bindings::io_pgtable_ops>,
     _marker: PhantomData<F>,
 }
 
 // SAFETY: `struct io_pgtable_ops` is not restricted to a single thread.
-unsafe impl<F: IoPageTableFmt> Send for IoPageTable<F> {}
+unsafe impl<F: IoPageTableFmt> Send for IoPageTable<'_, F> {}
 // SAFETY: `struct io_pgtable_ops` may be accessed concurrently.
-unsafe impl<F: IoPageTableFmt> Sync for IoPageTable<F> {}
+unsafe impl<F: IoPageTableFmt> Sync for IoPageTable<'_, F> {}
 
 /// The format used by this page table.
 pub trait IoPageTableFmt: 'static {
@@ -75,25 +77,10 @@ pub trait IoPageTableFmt: 'static {
     const FORMAT: io_pgtable_fmt;
 }
 
-impl<F: IoPageTableFmt> IoPageTable<F> {
-    /// Create a new `IoPageTable` as a device resource.
-    #[inline]
-    pub fn new(
-        dev: &Device<Bound>,
-        config: Config,
-    ) -> impl PinInit<Devres<IoPageTable<F>>, Error> + '_ {
-        // SAFETY: Devres ensures that the value is dropped during device unbind.
-        Devres::new(dev, unsafe { Self::new_raw(dev, config) })
-    }
-
+impl<'bound, F: IoPageTableFmt> IoPageTable<'bound, F> {
     /// Create a new `IoPageTable`.
-    ///
-    /// # Safety
-    ///
-    /// If successful, then the returned `IoPageTable` must be dropped before the device is
-    /// unbound.
     #[inline]
-    pub unsafe fn new_raw(dev: &Device<Bound>, config: Config) -> Result<IoPageTable<F>> {
+    pub fn new(dev: &'bound Device<Bound>, config: Config) -> Result<IoPageTable<'bound, F>> {
         let mut raw_cfg = bindings::io_pgtable_cfg {
             quirks: config.quirks,
             pgsize_bitmap: config.pgsize_bitmap,
@@ -117,9 +104,25 @@ impl<F: IoPageTableFmt> IoPageTable<F> {
 
         // INVARIANT: We successfully created a valid page table.
         Ok(IoPageTable {
+            dev,
             ptr: NonNull::new(ops).ok_or(ENOMEM)?,
             _marker: PhantomData,
         })
+    }
+
+    /// Create a new `IoPageTable` as a device resource.
+    #[inline]
+    pub fn into_devres(self) -> Result<DevresLt<IoPageTable<'static, F>>> {
+        let dev = self.dev;
+        // SAFETY: `self` is bound to `dev`. `DevresLt` revokes access and releases
+        // the resource when `dev` is unbound. Lifetimes do not affect layout, and
+        // the `ForLt` encoding ensures accessors shorten the lifetime back to the
+        // caller's borrow, so storing the page table through the `'static`
+        // representation is sound for the device-bound resource.
+        unsafe {
+            let pgtbl: IoPageTable<'static, F> = core::mem::transmute(self);
+            DevresLt::new(dev, pgtbl)
+        }
     }
 
     /// Obtain a raw pointer to the underlying `struct io_pgtable_ops`.
@@ -216,6 +219,10 @@ impl<F: IoPageTableFmt> IoPageTable<F> {
     }
 }
 
+impl<F: IoPageTableFmt> ForLt for IoPageTable<'static, F> {
+    type Of<'bound> = IoPageTable<'bound, F>;
+}
+
 // For the initial users of these rust bindings, the GPU FW is managing the IOTLB and performs all
 // required invalidations using a range. There is no need for it get ARM style invalidation
 // instructions from the page table code.
@@ -240,7 +247,7 @@ extern "C" fn rust_tlb_flush_walk_noop(
 ) {
 }
 
-impl<F: IoPageTableFmt> Drop for IoPageTable<F> {
+impl<F: IoPageTableFmt> Drop for IoPageTable<'_, F> {
     fn drop(&mut self) {
         // SAFETY: The caller of `Self::ttbr()` promised that the page table is not live when this
         // destructor runs.
@@ -255,7 +262,7 @@ impl IoPageTableFmt for ARM64LPAES1 {
     const FORMAT: io_pgtable_fmt = bindings::io_pgtable_fmt_ARM_64_LPAE_S1 as io_pgtable_fmt;
 }
 
-impl IoPageTable<ARM64LPAES1> {
+impl IoPageTable<'_, ARM64LPAES1> {
     /// Access the `ttbr` field of the configuration.
     ///
     /// This is the physical address of the page table, which may be passed to the device that
