@@ -618,6 +618,7 @@ mod tests {
         faux,
         page::PAGE_SIZE, //
     };
+    use kernel::types::ForLt;
 
     // The bare minimum needed to create a fake drm driver for kunit
 
@@ -662,6 +663,8 @@ mod tests {
         type Data = KunitData;
         type File = KunitFile;
         type Object<Ctx: DeviceContext> = Object<KunitObject, Ctx>;
+        type ParentDevice<Ctx: device::DeviceContext> = faux::Device<Ctx>;
+        type RegistrationData = ForLt!(());
 
         const INFO: drm::DriverInfo = INFO;
         const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor] = &[];
@@ -671,7 +674,7 @@ mod tests {
         // Create a faux DRM device so we can test gem object creation.
         let data = try_pin_init!(KunitData {});
         let dev = faux::Registration::new(c"Kunit", None)?;
-        let drm = UnregisteredDevice::new(dev.as_ref(), data)?;
+        let drm = UnregisteredDevice::new(dev.as_faux_device(), data)?;
 
         Ok((dev, drm))
     }
