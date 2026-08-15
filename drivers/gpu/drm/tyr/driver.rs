@@ -79,9 +79,6 @@ pub(crate) struct TyrDrmRegistrationData<'drm> {
     #[pin]
     regulators: Mutex<Regulators>,
 
-    /// GPU MMIO register mapping.
-    pub(crate) iomem: Arc<IoMem<'drm>>,
-
     /// GPU information read from hardware during probe.
     pub(crate) gpu_info: GpuInfo,
 }
@@ -118,12 +115,19 @@ impl platform::Driver for TyrPlatformDriver {
 
             let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
 
-            let iomem = Arc::new(request.iomap_sized::<SZ_2M>()?, GFP_KERNEL)?;
+            let hw = Arc::pin_init(
+                reset::HwGate::new(request.iomap_sized::<SZ_2M>()?),
+                GFP_KERNEL,
+            )?;
 
-            reset::run_reset(pdev.as_ref(), &iomem)?;
+            reset::run_reset(pdev.as_ref(), &hw)?;
 
-            let gpu_info = GpuInfo::new(&iomem);
-            gpu_info.log(pdev.as_ref());
+            let gpu_info = {
+                let hw_guard = hw.access();
+                let gpu_info = GpuInfo::new(hw_guard.iomem());
+                gpu_info.log(pdev.as_ref());
+                gpu_info
+            };
 
             let pa_bits = MMU_FEATURES::from_raw(gpu_info.mmu_features)
                 .pa_bits()
@@ -135,11 +139,11 @@ impl platform::Driver for TyrPlatformDriver {
 
             let unreg_dev = drm::UnregisteredDevice::<TyrDrmDriver>::new(pdev, Ok(()))?;
 
-            let mmu = Mmu::new(pdev.as_ref(), iomem.as_arc_borrow(), &gpu_info)?;
+            let mmu = Mmu::new(pdev.as_ref(), hw.clone(), &gpu_info)?;
 
             let firmware = Firmware::new(
                 pdev.as_ref(),
-                iomem.clone(),
+                hw.clone(),
                 &unreg_dev,
                 mmu.as_arc_borrow(),
                 &gpu_info,
@@ -158,7 +162,7 @@ impl platform::Driver for TyrPlatformDriver {
                         pdev,
                         // SAFETY: The registration is owned by platform driver data,
                         // so reset work is drained before borrowed data expires.
-                        reset <- unsafe { reset::ResetHandle::new(pdev, iomem.as_arc_borrow())? },
+                        reset <- unsafe { reset::ResetHandle::new(pdev, hw.clone())? },
                         fw: firmware,
                         clks <- new_mutex!(Clocks {
                             core: core_clk,
@@ -169,7 +173,6 @@ impl platform::Driver for TyrPlatformDriver {
                             _mali: mali_regulator,
                             _sram: sram_regulator,
                         }),
-                        iomem,
                         gpu_info,
                     }),
                 )},

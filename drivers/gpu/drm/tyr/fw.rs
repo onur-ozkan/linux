@@ -41,7 +41,6 @@ use kernel::{
 
 use crate::{
     driver::{
-        IoMem,
         TyrDrmDevice, //
     },
     fw::{
@@ -72,6 +71,7 @@ use crate::{
             JOB_IRQ_RAWSTAT, //
         }, //
     },
+    reset::HwGate,
     vm::Vm, //
 };
 
@@ -162,8 +162,8 @@ pub(super) struct Section<'drm> {
 /// Loaded firmware with sections mapped into MCU VM.
 #[pin_data(PinnedDrop)]
 pub(crate) struct Firmware<'drm> {
-    /// Iomem need to access registers.
-    iomem: Arc<IoMem<'drm>>,
+    /// Shared gate that coordinates hardware access with GPU reset.
+    hw: Arc<HwGate<'drm>>,
 
     /// MCU VM.
     vm: Arc<Vm<'drm>>,
@@ -236,7 +236,7 @@ impl<'drm> Firmware<'drm> {
     /// Load firmware and map sections into MCU VM.
     pub(crate) fn new(
         dev: &'drm Device<Bound>,
-        iomem: Arc<IoMem<'drm>>,
+        hw: Arc<HwGate<'drm>>,
         ddev: &TyrDrmDevice,
         mmu: ArcBorrow<'_, Mmu<'drm>>,
         gpu_info: &GpuInfo,
@@ -274,10 +274,11 @@ impl<'drm> Firmware<'drm> {
                 sections.push(Section { data, mem }, GFP_KERNEL)?;
             }
 
+            let firmware_vm = vm.clone();
             Arc::pin_init(
                 try_pin_init!(Firmware {
-                    iomem,
-                    vm: vm.clone(),
+                    hw,
+                    vm: firmware_vm,
                     sections,
                     global_iface <- new_mutex!(GlobalInterface::new()?),
                 }),
@@ -309,13 +310,15 @@ impl<'drm> Firmware<'drm> {
     /// Enable the global interface.
     pub(crate) fn enable_global_interface(&self, gpu_info: &GpuInfo, core_clk: &Clk) -> Result {
         let shared_section = self.shared_section()?;
+        let hw_guard = self.hw.access();
         self.global_iface
             .lock()
-            .enable(&self.iomem, shared_section, gpu_info, core_clk)
+            .enable(hw_guard.iomem(), shared_section, gpu_info, core_clk)
     }
 
     pub(crate) fn boot(&self) -> Result {
-        let io = &self.iomem;
+        let hw_guard = self.hw.access();
+        let io = hw_guard.iomem();
 
         // Discard any stale global interrupt.
         io.write_reg(JOB_IRQ_CLEAR::zeroed().with_glb(true));
@@ -345,7 +348,8 @@ impl<'drm> Firmware<'drm> {
     }
 
     fn stop(&self) -> Result {
-        let io = &self.iomem;
+        let hw_guard = self.hw.access();
+        let io = hw_guard.iomem();
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Disable));
 
         if let Err(e) = poll::read_poll_timeout(
