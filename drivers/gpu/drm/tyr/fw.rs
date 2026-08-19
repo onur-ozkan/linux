@@ -41,7 +41,6 @@ use kernel::{
 
 use crate::{
     driver::{
-        IoMem,
         TyrDrmDevice, //
     },
     fw::{
@@ -65,6 +64,7 @@ use crate::{
         MCU_CONTROL,
         MCU_STATUS, //
     },
+    reset::HwGate,
     vm::Vm, //
 };
 
@@ -148,8 +148,8 @@ pub(crate) struct Firmware<'bound> {
     /// Platform device reference (needed to access the MCU JOB_IRQ registers).
     _pdev: ARef<platform::Device>,
 
-    /// Iomem need to access registers.
-    iomem: Arc<IoMem<'bound>>,
+    /// Shared gate that coordinates hardware access with GPU reset.
+    hw: Arc<HwGate<'bound>>,
 
     /// MCU VM.
     vm: Arc<Vm<'bound>>,
@@ -221,7 +221,7 @@ impl<'bound> Firmware<'bound> {
     /// Load firmware and map sections into MCU VM.
     pub(crate) fn new(
         pdev: &'bound platform::Device<Bound>,
-        iomem: Arc<IoMem<'bound>>,
+        hw: Arc<HwGate<'bound>>,
         ddev: &TyrDrmDevice<Uninit>,
         mmu: ArcBorrow<'_, Mmu<'bound>>,
         gpu_info: &GpuInfo,
@@ -262,7 +262,7 @@ impl<'bound> Firmware<'bound> {
         let firmware = Arc::pin_init(
             try_pin_init!(Firmware {
                 _pdev: pdev.into(),
-                iomem,
+                hw,
                 vm,
                 sections,
                 global_iface <- new_mutex!(GlobalInterface::new()?),
@@ -288,7 +288,8 @@ impl<'bound> Firmware<'bound> {
     }
 
     pub(crate) fn boot(&self) -> Result {
-        let io = &self.iomem;
+        let hw_guard = self.hw.access();
+        let io = hw_guard.iomem();
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Auto));
 
         if let Err(e) = poll::read_poll_timeout(
@@ -307,8 +308,9 @@ impl<'bound> Firmware<'bound> {
     /// Enable the global interface.
     pub(crate) fn enable_global_interface(&self, gpu_info: &GpuInfo, core_clk: &Clk) -> Result {
         let shared_section = self.shared_section()?;
+        let hw_guard = self.hw.access();
         self.global_iface
             .lock()
-            .enable(&self.iomem, shared_section, gpu_info, core_clk)
+            .enable(hw_guard.iomem(), shared_section, gpu_info, core_clk)
     }
 }

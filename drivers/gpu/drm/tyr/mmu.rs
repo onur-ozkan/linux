@@ -26,7 +26,6 @@ use kernel::{
 };
 
 use crate::{
-    driver::IoMem,
     gpu::GpuInfo,
     mmu::address_space::{
         AddressSpaceManager,
@@ -36,6 +35,7 @@ use crate::{
         gpu_control::AS_PRESENT,
         MAX_AS, //
     },
+    reset::HwGate,
     slot::SlotManager, //
 };
 
@@ -67,14 +67,11 @@ pub(crate) struct Mmu<'bound> {
 
 impl<'bound> Mmu<'bound> {
     /// Create an MMU component for this device.
-    pub(crate) fn new(
-        iomem: ArcBorrow<'_, IoMem<'bound>>,
-        gpu_info: &GpuInfo,
-    ) -> Result<Arc<Mmu<'bound>>> {
+    pub(crate) fn new(hw: Arc<HwGate<'bound>>, gpu_info: &GpuInfo) -> Result<Arc<Mmu<'bound>>> {
         let present = AS_PRESENT::from_raw(gpu_info.as_present).present().get();
         let slot_count = present.count_ones().try_into()?;
 
-        let as_manager = AddressSpaceManager::new(iomem, present)?;
+        let as_manager = AddressSpaceManager::new(hw, present)?;
         let mmu_init = try_pin_init!(Self{
             as_manager <- new_mutex!(SlotManager::new(as_manager, slot_count)?),
         });

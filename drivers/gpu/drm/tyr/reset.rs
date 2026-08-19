@@ -21,7 +21,7 @@
 
 mod hw_gate;
 
-use hw_gate::HwGate;
+pub(crate) use hw_gate::HwGate;
 
 use kernel::{
     device::{
@@ -41,8 +41,7 @@ use kernel::{
             Full,
             Release, //
         },
-        Arc,
-        ArcBorrow, //
+        Arc, //
     },
     time,
     workqueue::{
@@ -84,13 +83,10 @@ unsafe impl AtomicType for ResetState {
 struct Controller<'ctrl> {
     /// Parent platform device.
     pdev: &'ctrl platform::Device<Bound>,
-    /// Mapped register space needed for reset operations.
-    iomem: Arc<IoMem<'ctrl>>,
     /// State shared by reset schedulers and the worker.
     state: Atomic<ResetState>,
-    /// Drains reset-sensitive hardware accesses before a reset.
-    #[pin]
-    hw: HwGate,
+    /// Shared gate that coordinates hardware access with GPU reset.
+    hw: Arc<HwGate<'ctrl>>,
 }
 
 impl<'ctrl> ScopedWorkItem for Controller<'ctrl> {
@@ -103,13 +99,12 @@ impl<'ctrl> Controller<'ctrl> {
     /// Creates a reset controller.
     fn new(
         pdev: &'ctrl platform::Device<Bound>,
-        iomem: Arc<IoMem<'ctrl>>,
+        hw: Arc<HwGate<'ctrl>>,
     ) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             pdev,
-            iomem,
             state: Atomic::new(ResetState::Idle),
-            hw <- HwGate::new(),
+            hw,
         })
     }
 
@@ -136,10 +131,7 @@ impl<'ctrl> Controller<'ctrl> {
 
         dev_dbg!(self.pdev, "Starting GPU reset.\n");
 
-        // Wait for current hardware accesses to finish before resetting.
-        let reset_guard = self.hw.close();
-        let reset_result = run_reset(self.pdev.as_ref(), &self.iomem);
-        drop(reset_guard);
+        let reset_result = run_reset(self.pdev.as_ref(), &self.hw);
 
         if let Err(e) = reset_result {
             dev_err!(self.pdev, "GPU reset failed: {:?}\n", e);
@@ -175,12 +167,10 @@ impl<'reset> ResetHandle<'reset> {
     /// running [`Drop`], since it owns work that may borrow from `'reset`.
     pub(crate) unsafe fn new(
         pdev: &'reset platform::Device<Bound>,
-        iomem: ArcBorrow<'_, IoMem<'reset>>,
+        hw: Arc<HwGate<'reset>>,
     ) -> Result<impl PinInit<Self, Error>> {
-        let iomem = iomem.into();
-
         Ok(try_pin_init!(Self {
-            controller <- kernel::new_scoped_work!("tyr::reset", Controller::new(pdev, iomem)),
+            controller <- kernel::new_scoped_work!("tyr::reset", Controller::new(pdev, hw)),
             // SAFETY: The caller guarantees the handle is dropped.
             wq: unsafe { ScopedQueue::new(c"tyr-reset-wq")? },
         }))
@@ -242,7 +232,10 @@ fn issue_soft_reset(dev: &Device<Bound>, io: &IoMem<'_>) -> Result {
 ///   - Trigger a GPU soft reset.
 ///   - Wait for the reset-complete IRQ status.
 ///   - Power L2 back on.
-pub(super) fn run_reset(dev: &Device<Bound>, iomem: &IoMem<'_>) -> Result {
+pub(super) fn run_reset(dev: &Device<Bound>, hw: &HwGate<'_>) -> Result {
+    let hw_guard = hw.close();
+    let iomem = hw_guard.iomem();
+
     issue_soft_reset(dev, iomem)?;
     gpu::l2_power_on(dev, iomem)?;
     Ok(())
