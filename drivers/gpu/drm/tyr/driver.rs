@@ -51,6 +51,11 @@ pub(crate) struct TyrPlatformDriver;
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct TyrPlatformDriverData<'bound> {
+    // `ResetHandle::drop()` drains queued/running works and this must happen
+    // before clocks/regulators are dropped. So keep this field before them to
+    // ensure the correct drop order.
+    #[pin]
+    _reset: reset::ResetHandle<'bound>,
     #[pin]
     _reg: drm::Registration<'bound, TyrDrmDriver>,
 }
@@ -63,12 +68,6 @@ pub(crate) struct TyrPlatformDriverData<'bound> {
 pub(crate) struct TyrDrmRegistrationData<'drm> {
     /// Parent platform device.
     pub(crate) pdev: &'drm platform::Device<Bound>,
-
-    // `ResetHandle::drop()` drains queued/running works and this must happen
-    // before clocks/regulators are dropped. So keep this field before them to
-    // ensure the correct drop order.
-    #[pin]
-    pub(crate) reset: reset::ResetHandle<'drm>,
 
     /// Firmware sections.
     pub(crate) fw: Arc<Firmware<'drm>>,
@@ -160,9 +159,6 @@ impl platform::Driver for TyrPlatformDriver {
                     unreg_dev,
                     try_pin_init!(TyrDrmRegistrationData {
                         pdev,
-                        // SAFETY: The registration is owned by platform driver data,
-                        // so reset work is drained before borrowed data expires.
-                        reset <- unsafe { reset::ResetHandle::new(pdev, hw.clone())? },
                         fw: firmware,
                         clks <- new_mutex!(Clocks {
                             core: core_clk,
@@ -176,6 +172,9 @@ impl platform::Driver for TyrPlatformDriver {
                         gpu_info,
                     }),
                 )},
+                // SAFETY: Platform driver data owns the handle and is dropped
+                // before its borrowed device and MMIO references expire.
+                _reset <- unsafe { reset::ResetHandle::new(pdev, hw)? },
                 _: { dev_dbg!(pdev, "Tyr initialized correctly.") },
             }))
         })
