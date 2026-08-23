@@ -28,12 +28,14 @@ use kernel::{
         Bound,
         Device, //
     },
+    drm,
     io::{
         poll,
         Io, //
     },
     platform,
     prelude::*,
+    revocable::Revocable,
     sync::{
         atomic::{
             Atomic,
@@ -53,7 +55,10 @@ use kernel::{
 };
 
 use crate::{
-    driver::IoMem,
+    driver::{
+        IoMem,
+        TyrDrmDriver, //
+    },
     gpu,
     regs::gpu_control::*, //
 };
@@ -80,13 +85,19 @@ unsafe impl AtomicType for ResetState {
 
 /// Internal reset orchestrator that owns the state, [`HwGate`], and work item.
 #[pin_data]
-struct Controller<'ctrl> {
+struct Controller<'ctrl>
+where
+    exists<'bound>: 'ctrl,
+{
     /// Parent platform device.
     pdev: &'ctrl platform::Device<Bound>,
     /// State shared by reset schedulers and the worker.
     state: Atomic<ResetState>,
     /// Shared gate that coordinates hardware access with GPU reset.
     hw: Arc<HwGate<'ctrl>>,
+    /// DRM registration revoked when a reset fails.
+    #[uses('bound: invariant)]
+    registration: Pin<&'ctrl Revocable<drm::Registration<'bound, TyrDrmDriver>>>,
 }
 
 impl<'ctrl> ScopedWorkItem for Controller<'ctrl> {
@@ -97,14 +108,16 @@ impl<'ctrl> ScopedWorkItem for Controller<'ctrl> {
 
 impl<'ctrl> Controller<'ctrl> {
     /// Creates a reset controller.
-    fn new(
+    fn new<'bound: 'ctrl>(
         pdev: &'ctrl platform::Device<Bound>,
         hw: Arc<HwGate<'ctrl>>,
-    ) -> impl PinInit<Self, Error> {
+        registration: Pin<&'ctrl Revocable<drm::Registration<'bound, TyrDrmDriver>>>,
+    ) -> impl PinInit<Self, Error> + use<'ctrl, 'bound> {
         try_pin_init!(Self {
             pdev,
             state: Atomic::new(ResetState::Idle),
             hw,
+            registration,
         })
     }
 
@@ -119,8 +132,8 @@ impl<'ctrl> Controller<'ctrl> {
     /// If the pending reset cannot be claimed, the worker returns immediately.
     ///
     /// It first claims [`ResetState::Pending`], then waits for earlier hardware
-    /// accesses to complete before issuing the reset and returning the worker
-    /// state to [`ResetState::Idle`].
+    /// accesses to complete before issuing the reset. A successful reset returns
+    /// the worker state to [`ResetState::Idle`]; a failure unplugs the DRM device.
     ///
     /// Panthor reference:
     /// - drivers/gpu/drm/panthor/panthor_device.c::panthor_device_reset_work()
@@ -134,16 +147,13 @@ impl<'ctrl> Controller<'ctrl> {
         let reset_result = run_reset(self.pdev.as_ref(), &self.hw);
 
         if let Err(e) = reset_result {
-            dev_err!(self.pdev, "GPU reset failed: {:?}\n", e);
-
-            // TODO: Unplug the GPU.
-            // There is no API for unplugging the GPU and this is unreachable
-            // for now since there are no hardware users for reset API.
+            dev_err!(self.pdev, "GPU reset failed, unplugging the GPU: {:?}\n", e);
+            let _ = self.try_transition(ResetState::InProgress, ResetState::ShuttingDown);
+            self.with_registration(|reg| reg.revoke());
         } else {
             dev_dbg!(self.pdev, "GPU reset completed.\n");
+            let _ = self.try_transition(ResetState::InProgress, ResetState::Idle);
         }
-
-        let _ = self.try_transition(ResetState::InProgress, ResetState::Idle);
     }
 }
 
@@ -165,12 +175,16 @@ impl<'reset> ResetHandle<'reset> {
     ///
     /// The returned handle must not be leaked or otherwise prevented from
     /// running [`Drop`], since it owns work that may borrow from `'reset`.
-    pub(crate) unsafe fn new(
+    pub(crate) unsafe fn new<'bound: 'reset>(
         pdev: &'reset platform::Device<Bound>,
         hw: Arc<HwGate<'reset>>,
-    ) -> Result<impl PinInit<Self, Error>> {
+        registration: Pin<&'reset Revocable<drm::Registration<'bound, TyrDrmDriver>>>,
+    ) -> Result<impl PinInit<Self, Error> + use<'reset, 'bound>> {
         Ok(try_pin_init!(Self {
-            controller <- kernel::new_scoped_work!("tyr::reset", Controller::new(pdev, hw)),
+            controller <- kernel::new_scoped_work!(
+                "tyr::reset",
+                Controller::new(pdev, hw, registration)
+            ),
             // SAFETY: The caller guarantees the handle is dropped.
             wq: unsafe { ScopedQueue::new(c"tyr-reset-wq")? },
         }))
@@ -180,7 +194,7 @@ impl<'reset> ResetHandle<'reset> {
     ///
     /// If a reset is already pending or in progress the call is a no-op.
     #[expect(dead_code)]
-    pub(crate) fn schedule(&'reset self) {
+    pub(crate) fn schedule(&self) {
         // TODO: Similar to `panthor_device_schedule_reset()` in Panthor, add a
         // power management check once Tyr supports it.
 
@@ -188,7 +202,10 @@ impl<'reset> ResetHandle<'reset> {
             .controller
             .try_transition(ResetState::Idle, ResetState::Pending)
         {
-            let _ = self.wq.enqueue(&self.controller);
+            // SAFETY: The controller is pinned in this handle and its work is
+            // cancelled synchronously on drop. The constructor requires that
+            // the handle is not leaked, so its borrowed data remains valid.
+            let _ = unsafe { self.wq.enqueue_scoped(&self.controller) };
         }
     }
 }
