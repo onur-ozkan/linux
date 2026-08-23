@@ -22,6 +22,7 @@ use kernel::{
     prelude::*,
     regulator,
     regulator::Regulator,
+    revocable::Revocable,
     sizes::SZ_2M,
     sync::{
         Arc,
@@ -49,15 +50,16 @@ pub(crate) type TyrDrmDevice<Ctx = drm::Normal> = drm::Device<TyrDrmDriver, Ctx>
 
 pub(crate) struct TyrPlatformDriver;
 
-#[pin_data(PinnedDrop)]
+#[pin_data]
 pub(crate) struct TyrPlatformDriverData<'bound> {
     // `ResetHandle::drop()` drains queued/running works and this must happen
     // before clocks/regulators are dropped. So keep this field before them to
     // ensure the correct drop order.
     #[pin]
-    _reset: reset::ResetHandle<'bound>,
+    #[uses('_reg: invariant)]
+    _reset: reset::ResetHandle<'_reg>,
     #[pin]
-    _reg: drm::Registration<'bound, TyrDrmDriver>,
+    _reg: Revocable<drm::Registration<'bound, TyrDrmDriver>>,
 }
 
 /// Data owned by the DRM [`Registration`].
@@ -152,9 +154,10 @@ impl platform::Driver for TyrPlatformDriver {
             firmware.enable_global_interface(&gpu_info, &core_clk)?;
 
             Ok(try_pin_init!(TyrPlatformDriverData {
-                // SAFETY: `_reg` is stored in `TyrPlatformDriverData` and dropped when the
-                // driver is unbound; it is never forgotten.
-                _reg <- unsafe { drm::Registration::new(
+                // SAFETY: `_reg` is stored in the platform driver data and is not leaked or
+                // forgotten, so it is dropped before the `'bound` registration data can
+                // become invalid.
+                _reg <- Revocable::new(unsafe { drm::Registration::new(
                     pdev.as_ref(),
                     unreg_dev,
                     try_pin_init!(TyrDrmRegistrationData {
@@ -171,19 +174,14 @@ impl platform::Driver for TyrPlatformDriver {
                         }),
                         gpu_info,
                     }),
-                )},
+                )}),
                 // SAFETY: `ResetHandle` is stored in platform driver data and is
-                // dropped before the borrowed device and MMIO references expire.
-                _reset <- unsafe { reset::ResetHandle::new(pdev, hw)? },
+                // dropped before the borrowed registration, device and MMIO references expire.
+                _reset <- unsafe { reset::ResetHandle::new(pdev, hw, _reg)? },
                 _: { dev_dbg!(pdev, "Tyr initialized correctly.") },
             }))
         })
     }
-}
-
-#[pinned_drop]
-impl PinnedDrop for TyrPlatformDriverData<'_> {
-    fn drop(self: Pin<&mut Self>) {}
 }
 
 // We need to retain the name "panthor" to achieve drop-in compatibility with
