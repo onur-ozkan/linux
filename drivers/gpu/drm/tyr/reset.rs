@@ -21,7 +21,7 @@
 
 mod hw_gate;
 
-use hw_gate::HwGate;
+pub(crate) use hw_gate::HwGate;
 
 use kernel::{
     device::{
@@ -41,8 +41,7 @@ use kernel::{
             Full,
             Release, //
         },
-        Arc,
-        ArcBorrow, //
+        Arc, //
     },
     time,
     workqueue::{
@@ -84,13 +83,10 @@ unsafe impl AtomicType for ResetState {
 struct Controller<'ctrl> {
     /// Parent platform device.
     pdev: &'ctrl platform::Device<Bound>,
-    /// Mapped register space needed for reset operations.
-    iomem: Arc<IoMem<'ctrl>>,
     /// State shared by reset schedulers and the worker.
     state: Atomic<ResetState>,
-    /// Drains reset-sensitive hardware accesses before a reset.
-    #[pin]
-    hw: HwGate,
+    /// Shared gate that coordinates hardware access with GPU reset.
+    hw: Arc<HwGate<'ctrl>>,
 }
 
 impl<'ctrl> ScopedWorkItem for Controller<'ctrl> {
@@ -103,13 +99,12 @@ impl<'ctrl> Controller<'ctrl> {
     /// Creates a reset controller.
     fn new(
         pdev: &'ctrl platform::Device<Bound>,
-        iomem: Arc<IoMem<'ctrl>>,
+        hw: Arc<HwGate<'ctrl>>,
     ) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             pdev,
-            iomem,
             state: Atomic::new(ResetState::Idle),
-            hw <- HwGate::new(),
+            hw,
         })
     }
 
@@ -137,7 +132,7 @@ impl<'ctrl> Controller<'ctrl> {
         dev_dbg!(self.pdev, "Starting GPU reset.\n");
 
         let reset_guard = self.hw.close();
-        let reset_result = run_reset(self.pdev.as_ref(), &self.iomem);
+        let reset_result = run_reset(self.pdev.as_ref(), reset_guard.iomem());
         let _ = self.try_transition(ResetState::InProgress, ResetState::Idle);
         drop(reset_guard);
 
@@ -173,16 +168,14 @@ impl<'reset> ResetHandle<'reset> {
     /// running [`Drop`], since it owns work that may borrow from `'reset`.
     pub(crate) unsafe fn new(
         pdev: &'reset platform::Device<Bound>,
-        iomem: ArcBorrow<'_, IoMem<'reset>>,
+        hw: Arc<HwGate<'reset>>,
     ) -> impl PinInit<Self, Error> {
-        let iomem = iomem.into();
-
         try_pin_init!(Self {
             wq: Queue::new_ordered().build(c"tyr-reset-wq")?,
             // SAFETY: The caller guarantees that the handle is dropped and `controller`
             // is declared before `wq`, so its destructor runs before the queue expires.
             controller <- unsafe {
-                kernel::new_scoped_work!(wq, "tyr::reset", Controller::new(pdev, iomem))
+                kernel::new_scoped_work!(wq, "tyr::reset", Controller::new(pdev, hw))
             },
         })
     }
