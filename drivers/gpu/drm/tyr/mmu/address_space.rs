@@ -49,6 +49,7 @@ use crate::{
         mmu_control::mmu_as_control::*,
         MAX_AS, //
     },
+    reset::HwGate,
     slot::{
         LockedSeat,
         Seat,
@@ -147,12 +148,16 @@ impl<'drm> VmAsData<'drm> {
 
 /// Coordinates all hardware-level address space operations through MMIO register
 /// operations including enabling, disabling, flushing, and updating address spaces.
+///
+/// Each hardware operation acquires the hardware-access gate once and passes the
+/// guarded MMIO reference to its helpers. Helpers must not re-enter the gate while
+/// an operation holds an SRCU read-side guard.
 pub(crate) struct AddressSpaceManager<'drm> {
     /// Parent device used for logging.
     dev: &'drm Device<Bound>,
 
-    /// Memory-mapped I/O region for GPU register access.
-    iomem: Arc<IoMem<'drm>>,
+    /// Shared gate that coordinates hardware access with GPU reset.
+    hw: Arc<HwGate<'drm>>,
 
     /// Bitmask of present address space slots from GPU_AS_PRESENT register.
     as_present: u32,
@@ -161,11 +166,11 @@ pub(crate) struct AddressSpaceManager<'drm> {
 impl<'drm> AddressSpaceManager<'drm> {
     /// Creates a new address space manager.
     ///
-    /// Initializes the manager with references to the platform device and
-    /// I/O memory region, along with the bitmask of available AS slots.
+    /// Initializes the manager with the device, hardware-access gate and bitmask
+    /// of available AS slots.
     pub(super) fn new(
         dev: &'drm Device<Bound>,
-        iomem: Arc<IoMem<'drm>>,
+        hw: Arc<HwGate<'drm>>,
         as_present: u32,
     ) -> Result<AddressSpaceManager<'drm>> {
         if as_present.trailing_ones() != as_present.count_ones() {
@@ -178,7 +183,7 @@ impl<'drm> AddressSpaceManager<'drm> {
         }
         Ok(Self {
             dev,
-            iomem,
+            hw,
             as_present,
         })
     }
@@ -215,8 +220,7 @@ impl<'drm> AddressSpaceManager<'drm> {
     /// Waits for an AS slot to become ready (not active).
     ///
     /// Returns an error if polling times out after 10ms or if register access fails.
-    fn as_wait_ready(&self, as_nr: usize) -> Result {
-        let io = &*self.iomem;
+    fn as_wait_ready(&self, io: &IoMem<'_>, as_nr: usize) -> Result {
         let op = || {
             let status_reg = STATUS::try_at(as_nr).ok_or(EINVAL)?;
             Ok(io.read(status_reg))
@@ -230,9 +234,8 @@ impl<'drm> AddressSpaceManager<'drm> {
     /// Sends a command to an AS slot.
     ///
     /// Returns an error if waiting for ready times out or if register write fails.
-    fn as_send_cmd(&mut self, as_nr: usize, cmd: MmuCommand) -> Result {
-        self.as_wait_ready(as_nr)?;
-        let io = &*self.iomem;
+    fn as_send_cmd(&mut self, io: &IoMem<'_>, as_nr: usize, cmd: MmuCommand) -> Result {
+        self.as_wait_ready(io, as_nr)?;
         let command_reg = COMMAND::try_at(as_nr).ok_or(EINVAL)?;
         io.write(command_reg, COMMAND::zeroed().with_command(cmd));
         Ok(())
@@ -241,19 +244,22 @@ impl<'drm> AddressSpaceManager<'drm> {
     /// Sends a command to an AS slot and waits for completion.
     ///
     /// Returns an error if sending the command fails or if waiting for completion times out.
-    fn as_send_cmd_and_wait(&mut self, as_nr: usize, cmd: MmuCommand) -> Result {
-        self.as_send_cmd(as_nr, cmd)?;
-        self.as_wait_ready(as_nr)?;
+    fn as_send_cmd_and_wait(&mut self, io: &IoMem<'_>, as_nr: usize, cmd: MmuCommand) -> Result {
+        self.as_send_cmd(io, as_nr, cmd)?;
+        self.as_wait_ready(io, as_nr)?;
         Ok(())
     }
 
     /// Enables an AS slot with the provided configuration.
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
-    fn as_enable(&mut self, as_nr: usize, as_config: &AddressSpaceConfig) -> Result {
+    fn as_enable(
+        &mut self,
+        io: &IoMem<'_>,
+        as_nr: usize,
+        as_config: &AddressSpaceConfig,
+    ) -> Result {
         self.validate_as_slot(as_nr)?;
-
-        let io = &*self.iomem;
 
         let transtab = as_config.transtab;
         io.write(
@@ -285,7 +291,7 @@ impl<'drm> AddressSpaceManager<'drm> {
             MEMATTR_HI::from_raw((memattr >> 32) as u32),
         );
 
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
+        self.as_send_cmd_and_wait(io, as_nr, MmuCommand::Update)?;
 
         Ok(())
     }
@@ -293,13 +299,11 @@ impl<'drm> AddressSpaceManager<'drm> {
     /// Disables an AS slot and clears its configuration.
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
-    fn as_disable(&mut self, as_nr: usize) -> Result {
+    fn as_disable(&mut self, io: &IoMem<'_>, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
 
         // Flush AS before disabling
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushMem)?;
-
-        let io = &*self.iomem;
+        self.as_send_cmd_and_wait(io, as_nr, MmuCommand::FlushMem)?;
 
         io.write(
             TRANSTAB_LO::try_at(as_nr).ok_or(EINVAL)?,
@@ -332,7 +336,7 @@ impl<'drm> AddressSpaceManager<'drm> {
             TRANSCFG_HI::from_raw((transcfg >> 32) as u32),
         );
 
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::Update)?;
+        self.as_send_cmd_and_wait(io, as_nr, MmuCommand::Update)?;
 
         Ok(())
     }
@@ -344,7 +348,7 @@ impl<'drm> AddressSpaceManager<'drm> {
     /// power-of-two region aligned to its size.
     ///
     /// Returns an error if the slot is invalid or if register writes/commands fail.
-    fn as_start_update(&mut self, as_nr: usize, region: &Range<u64>) -> Result {
+    fn as_start_update(&mut self, io: &IoMem<'_>, as_nr: usize, region: &Range<u64>) -> Result {
         self.validate_as_slot(as_nr)?;
 
         // Avoid both an empty range and an inverted range.
@@ -394,8 +398,6 @@ impl<'drm> AddressSpaceManager<'drm> {
         // because log2(32 KiB) = 15.
         let lockaddr_size = lock_region_log2 - 1;
 
-        let io = &*self.iomem;
-
         // The LOCKADDR base field stores address bits 63:12, so remove the low 12 bits
         // before passing this value to the register macro helper.
         // These bits are guaranteed to be zero anyway because of the minimum
@@ -415,24 +417,24 @@ impl<'drm> AddressSpaceManager<'drm> {
             LOCKADDR_HI::from_raw((lockaddr_val >> 32) as u32),
         );
 
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::Lock)
+        self.as_send_cmd_and_wait(io, as_nr, MmuCommand::Lock)
     }
 
     /// Completes an atomic translation table update.
     ///
     /// Returns an error if the slot is invalid or if the flush command fails.
-    fn as_end_update(&mut self, as_nr: usize) -> Result {
+    fn as_end_update(&mut self, io: &IoMem<'_>, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushPt)?;
+        self.as_send_cmd_and_wait(io, as_nr, MmuCommand::FlushPt)?;
         Ok(())
     }
 
     /// Flushes the translation table cache for an AS slot.
     ///
     /// Returns an error if the slot is invalid or if the flush command fails.
-    fn as_flush(&mut self, as_nr: usize) -> Result {
+    fn as_flush(&mut self, io: &IoMem<'_>, as_nr: usize) -> Result {
         self.validate_as_slot(as_nr)?;
-        self.as_send_cmd_and_wait(as_nr, MmuCommand::FlushPt)
+        self.as_send_cmd_and_wait(io, as_nr, MmuCommand::FlushPt)
     }
 }
 
@@ -447,13 +449,18 @@ impl<'drm> SlotOperations<MAX_AS> for AddressSpaceManager<'drm> {
     /// Activates a VM in a hardware slot.
     fn activate(&mut self, slot_idx: usize, slot_data: &Self::SlotData) -> Result {
         let as_config = slot_data.as_config()?;
-        self.as_enable(slot_idx, &as_config)
+        let hw = self.hw.clone();
+        let hw_guard = hw.access();
+        self.as_enable(hw_guard.iomem(), slot_idx, &as_config)
     }
 
     /// Evicts a VM from a hardware slot.
     fn evict(&mut self, slot_idx: usize, _slot_data: &Self::SlotData) -> Result {
-        self.as_flush(slot_idx)?;
-        self.as_disable(slot_idx)?;
+        let hw = self.hw.clone();
+        let hw_guard = hw.access();
+        let io = hw_guard.iomem();
+        self.as_flush(io, slot_idx)?;
+        self.as_disable(io, slot_idx)?;
         Ok(())
     }
 }
@@ -469,7 +476,9 @@ impl<'drm> AsSlotManager<'drm> {
         match seat.slot() {
             Some(slot) => {
                 let as_nr = slot as usize;
-                self.as_start_update(as_nr, region)
+                let hw = self.hw.clone();
+                let hw_guard = hw.access();
+                self.as_start_update(hw_guard.iomem(), as_nr, region)
             }
             _ => Ok(()),
         }
@@ -481,7 +490,9 @@ impl<'drm> AsSlotManager<'drm> {
         match seat.slot() {
             Some(slot) => {
                 let as_nr = slot as usize;
-                self.as_end_update(as_nr)
+                let hw = self.hw.clone();
+                let hw_guard = hw.access();
+                self.as_end_update(hw_guard.iomem(), as_nr)
             }
             _ => Ok(()),
         }
@@ -493,7 +504,9 @@ impl<'drm> AsSlotManager<'drm> {
         match seat.slot() {
             Some(slot) => {
                 let as_nr = slot as usize;
-                self.as_flush(as_nr)
+                let hw = self.hw.clone();
+                let hw_guard = hw.access();
+                self.as_flush(hw_guard.iomem(), as_nr)
             }
             _ => Ok(()),
         }

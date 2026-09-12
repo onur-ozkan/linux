@@ -18,9 +18,13 @@ use kernel::{
     },
 };
 
+use crate::driver::IoMem;
+
 /// Synchronizes GPU hardware access with reset.
 #[pin_data]
-pub(super) struct HwGate {
+pub(crate) struct HwGate<'hw> {
+    /// GPU MMIO register mapping.
+    iomem: IoMem<'hw>,
     /// Admits readers and is held exclusively while the reset worker owns the
     /// hardware.
     #[pin]
@@ -30,30 +34,37 @@ pub(super) struct HwGate {
     srcu: Srcu,
 }
 
-impl HwGate {
+impl<'hw> HwGate<'hw> {
     /// Creates an open hardware-access gate.
-    pub(super) fn new() -> impl PinInit<Self, Error> {
+    pub(crate) fn new(iomem: IoMem<'hw>) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
+            iomem,
             gate_lock <- new_mutex!(()),
             srcu <- kernel::new_srcu!(),
         })
     }
 
     /// Enters a reset-sensitive hardware-access section.
-    #[expect(dead_code)]
-    fn access(&self) -> HwAccessGuard<'_> {
+    ///
+    /// This gate is not reentrant. Acquire it once for the whole hardware operation
+    /// and pass the guard's MMIO reference to helpers. Re-entering while holding a
+    /// guard can deadlock with a reset holding `gate_lock` while draining readers.
+    pub(crate) fn access(&self) -> HwAccessGuard<'_, 'hw> {
         let gate_lock = self.gate_lock.lock();
         let srcu = self.srcu.read_lock();
         drop(gate_lock);
 
-        HwAccessGuard { _srcu: srcu }
+        HwAccessGuard {
+            gate: self,
+            _srcu: srcu,
+        }
     }
 
     /// Stops new readers and drains admitted readers for the reset worker.
     ///
     /// Callers must serialize write-side access. The reset controller's state
     /// machine provides that serialization.
-    pub(super) fn close(&self) -> HwClosedGuard<'_> {
+    pub(super) fn close(&self) -> HwClosedGuard<'_, 'hw> {
         let gate_lock = self.gate_lock.lock();
 
         // Holding `gate_lock` prevents new readers from entering SRCU. Readers
@@ -61,6 +72,7 @@ impl HwGate {
         self.srcu.synchronize();
 
         HwClosedGuard {
+            gate: self,
             _gate_lock: gate_lock,
         }
     }
@@ -68,13 +80,27 @@ impl HwGate {
 
 /// Shared hardware access that blocks reset until dropped.
 #[must_use = "the gate is released when the guard is dropped"]
-struct HwAccessGuard<'a> {
+pub(crate) struct HwAccessGuard<'a, 'hw> {
+    gate: &'a HwGate<'hw>,
     _srcu: srcu::Guard<'a>,
+}
+
+impl<'a, 'hw> HwAccessGuard<'a, 'hw> {
+    pub(crate) fn iomem(&self) -> &IoMem<'hw> {
+        &self.gate.iomem
+    }
 }
 
 /// Exclusive hardware access for the reset worker that blocks new hardware
 /// accesses until dropped.
 #[must_use = "the gate stays closed until the guard is dropped"]
-pub(super) struct HwClosedGuard<'a> {
+pub(super) struct HwClosedGuard<'a, 'hw> {
+    gate: &'a HwGate<'hw>,
     _gate_lock: MutexGuard<'a, ()>,
+}
+
+impl<'a, 'hw> HwClosedGuard<'a, 'hw> {
+    pub(super) fn iomem(&self) -> &IoMem<'hw> {
+        &self.gate.iomem
+    }
 }

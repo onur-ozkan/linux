@@ -38,7 +38,6 @@ use kernel::{
 
 use crate::{
     driver::{
-        IoMem,
         TyrDrmDevice, //
     },
     fw::parser::{
@@ -66,6 +65,7 @@ use crate::{
             JOB_IRQ_RAWSTAT, //
         }, //
     },
+    reset::HwGate,
     vm::Vm, //
 };
 
@@ -144,8 +144,8 @@ struct Section<'drm> {
 
 /// Loaded firmware with sections mapped into MCU VM.
 pub(crate) struct Firmware<'drm> {
-    /// Iomem need to access registers.
-    iomem: Arc<IoMem<'drm>>,
+    /// Shared gate that coordinates hardware access with GPU reset.
+    hw: Arc<HwGate<'drm>>,
 
     /// MCU VM.
     vm: Arc<Vm<'drm>>,
@@ -214,7 +214,7 @@ impl<'drm> Firmware<'drm> {
     /// Load firmware and map sections into MCU VM.
     pub(crate) fn new(
         dev: &'drm Device<Bound>,
-        iomem: Arc<IoMem<'drm>>,
+        hw: Arc<HwGate<'drm>>,
         ddev: &TyrDrmDevice,
         mmu: ArcBorrow<'_, Mmu<'drm>>,
         gpu_info: &GpuInfo,
@@ -253,7 +253,7 @@ impl<'drm> Firmware<'drm> {
             }
 
             Ok(Firmware {
-                iomem,
+                hw,
                 vm: vm.clone(),
                 sections,
             })
@@ -267,7 +267,8 @@ impl<'drm> Firmware<'drm> {
     }
 
     pub(crate) fn boot(&self) -> Result {
-        let io = &self.iomem;
+        let hw_guard = self.hw.access();
+        let io = hw_guard.iomem();
 
         // Discard any stale global interrupt.
         io.write_reg(JOB_IRQ_CLEAR::zeroed().with_glb(true));
@@ -297,7 +298,8 @@ impl<'drm> Firmware<'drm> {
     }
 
     fn stop(&self) -> Result {
-        let io = &self.iomem;
+        let hw_guard = self.hw.access();
+        let io = hw_guard.iomem();
         io.write_reg(MCU_CONTROL::zeroed().with_req(McuControlMode::Disable));
 
         if let Err(e) = poll::read_poll_timeout(
