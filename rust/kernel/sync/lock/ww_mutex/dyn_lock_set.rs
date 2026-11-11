@@ -87,8 +87,8 @@ impl<'ctx, 'm> DynLockSet<'ctx, 'm> {
     ///
     /// `work` runs once after acquisition and must not acquire more locks. Its errors
     /// are returned without retrying. All locks and pending backoff state are released
-    /// on return. The callbacks must not change the set's context or nest transactions
-    /// on that context.
+    /// on return and the context is reinitialized for reuse. The callbacks must not
+    /// change the set's context or nest transactions on that context.
     ///
     /// # Panics
     ///
@@ -158,8 +158,7 @@ impl<'ctx, 'm> DynLockSet<'ctx, 'm> {
         let result = result.and_then(|()| work(self));
 
         self.clear();
-        ctx.clear_backoff();
-        ctx.assert_no_locks_held();
+        ctx.restart();
 
         result
     }
@@ -291,7 +290,10 @@ mod tests {
 
             set.ww_transaction(
                 |set| set.lock(&mutex),
-                |set| set.with_locked(&mutex, |value| *value += 1),
+                |set| {
+                    ctx.done();
+                    set.with_locked(&mutex, |value| *value += 1)
+                },
             )?;
 
             assert!(!mutex.is_locked());

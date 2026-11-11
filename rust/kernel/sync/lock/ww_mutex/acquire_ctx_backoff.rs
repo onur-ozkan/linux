@@ -369,15 +369,29 @@ mod tests {
         let ctx = AcquireCtxBackoff::new(acquire_ctx.as_mut());
         let mut set = DynLockSet::new(&ctx);
 
-        for swallow in [false, true] {
+        for (swallow, fail_work) in [(false, false), (true, false), (true, true)] {
             let mut work_ran = false;
+            let mut stamp = 0;
             let result = set.ww_transaction(
                 |set| {
                     set.lock(&first)?;
-                    // A swallowed or mapped EDEADLK must not poison the next call.
+                    // Simulate EDEADLK in both Rust and C so cleanup must reset both.
                     // SAFETY: `contended` is initialized, pinned, and outlives the transaction.
                     let mutex = unsafe { Mutex::from_raw(contended.inner.get()) };
                     ctx.contended.set(Some(mutex));
+                    // SAFETY: This task owns the initialized context and its only lock.
+                    unsafe {
+                        let ptr = ctx.ctx.inner.get();
+                        stamp = (*ptr).stamp;
+                        (*ptr).wounded = 1;
+                        #[cfg(any(
+                            CONFIG_DEBUG_MUTEXES,
+                            all(CONFIG_PREEMPT_RT, CONFIG_DEBUG_RT_MUTEXES)
+                        ))]
+                        {
+                            (*ptr).contending_lock = contended.inner.get().cast();
+                        }
+                    }
                     assert_eq!(set.lock(&first), Err(EDEADLK));
                     if swallow {
                         Ok(())
@@ -388,15 +402,43 @@ mod tests {
                 |set| {
                     work_ran = true;
                     ctx.done();
-                    set.with_locked(&first, |v| *v += 1)
+                    set.with_locked(&first, |v| *v += 1)?;
+                    if fail_work {
+                        Err(EINVAL)
+                    } else {
+                        Ok(())
+                    }
                 },
             );
 
-            assert_eq!(result, if swallow { Ok(()) } else { Err(EINVAL) });
+            assert_eq!(
+                result,
+                if swallow && !fail_work {
+                    Ok(())
+                } else {
+                    Err(EINVAL)
+                }
+            );
             assert_eq!(work_ran, swallow);
             assert!(ctx.contended.get().is_none());
             assert!(!first.is_locked());
             assert!(!contended.is_locked());
+
+            // SAFETY: The context is initialized, belongs to this task, and has
+            // no acquired locks, so no other task can wound it.
+            let state = unsafe { &*ctx.ctx.inner.get() };
+            assert!(state.stamp != stamp);
+            assert_eq!(state.wounded, 0);
+            #[cfg(any(CONFIG_DEBUG_MUTEXES, all(CONFIG_PREEMPT_RT, CONFIG_DEBUG_RT_MUTEXES)))]
+            {
+                assert_eq!(state.done_acquire, 0);
+                assert!(state.contending_lock.is_null());
+            }
+
+            // Reuse the context without a transaction's entry-time reset.
+            set.lock(&first)?;
+            set.clear();
+            drop(ctx.lock(&first)?);
 
             set.ww_transaction(
                 |set| {
